@@ -1,3 +1,4 @@
+from calendar import c
 import torch
 from mmcv.runner.fp16_utils import force_fp32
 from mmdet.core import bbox2roi, multi_apply
@@ -333,9 +334,16 @@ class SoftTeacherSingle(MultiSteamDetector):
         student_info["img"] = img
         feat = self.student.extract_feat(img)
         student_info["backbone_feature"] = feat
+
         if self.student.with_rpn:
             rpn_out = self.student.rpn_head(feat)
             student_info["rpn_out"] = list(rpn_out)
+        else:
+            cls_score, bbox_pred, centerness = self.student.forward(feat)
+            student_info["cls_score"] = list(cls_score)
+            student_info["bbox_pred"] = list(bbox_pred)
+            student_info["centerness"] = list(centerness)
+        
         student_info["img_metas"] = img_metas
         student_info["proposals"] = proposals
         student_info["transform_matrix"] = [
