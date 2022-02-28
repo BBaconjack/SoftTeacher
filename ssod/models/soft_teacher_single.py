@@ -1,8 +1,10 @@
 from calendar import c
+from ctypes.wintypes import PDWORD
 import torch
 from mmcv.runner.fp16_utils import force_fp32
 from mmdet.core import bbox2roi, multi_apply
 from mmdet.models import DETECTORS, build_detector
+from ssod.datasets.pipelines.formatting import PseudoSamples
 
 from ssod.utils.structure_utils import dict_split, weighted_loss
 from ssod.utils import log_image_with_boxes, log_every_n
@@ -81,7 +83,7 @@ class SoftTeacherSingle(MultiSteamDetector):
         M = self._get_trans_mat(
             teacher_info["transform_matrix"], student_info["transform_matrix"]
         )
-
+        #伪标签detboxes带有bbox jittering refine的uncertainty
         pseudo_bboxes = self._transform_bbox(
             teacher_info["det_bboxes"],
             M,
@@ -89,15 +91,29 @@ class SoftTeacherSingle(MultiSteamDetector):
         )
         pseudo_labels = teacher_info["det_labels"]
         loss = {}
-        rpn_loss, proposal_list = self.rpn_loss(
-            student_info["rpn_out"],
-            pseudo_bboxes,
-            student_info["img_metas"],
-            student_info=student_info,
-        )
-        loss.update(rpn_loss)
-        if proposal_list is not None:
-            student_info["proposals"] = proposal_list
+
+        cls_loss = self.unsup_fcos_cls_loss()
+        centerness_loss = self.unsup_fcos_centerness_loss()
+        bbox_loss = self.unsup_fcos_bbox_loss()
+        loss.update(cls_loss)
+        loss.update(centerness_loss)
+        loss.update(bbox_loss)
+        def unsup_fcos_centerness_loss(self):
+            pass
+        def unsup_fcos_bbox_loss(self):
+            pass
+        # #rpn loss
+        # rpn_loss, proposal_list = self.rpn_loss(
+        #     student_info["rpn_out"],
+        #     pseudo_bboxes,
+        #     student_info["img_metas"],
+        #     student_info=student_info,
+        # )
+        # loss.update(rpn_loss)
+        # if proposal_list is not None:
+        #     student_info["proposals"] = proposal_list
+        # #实现了使用老师模型的proposal输出学生模型的roi head
+
         if self.train_cfg.use_teacher_proposal:
             proposals = self._transform_bbox(
                 teacher_info["proposals"],
@@ -180,7 +196,7 @@ class SoftTeacherSingle(MultiSteamDetector):
         else:
             return {}, None
 
-    def unsup_rcnn_cls_loss(
+    def unsup_fcos_cls_loss(
         self,
         feat,
         img_metas,
@@ -202,7 +218,7 @@ class SoftTeacherSingle(MultiSteamDetector):
             thr=self.train_cfg.cls_pseudo_threshold,
         )
         log_every_n(
-            {"rcnn_cls_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
+            {"fcos_cls_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
         )
         sampling_results = self.get_sampling_result(
             img_metas,
@@ -232,7 +248,9 @@ class SoftTeacherSingle(MultiSteamDetector):
             )
             bg_score = torch.cat([_score[:, -1] for _score in _scores])
             assigned_label, _, _, _ = bbox_targets
+            #找出被分为背景的框，因为背景框被预测的label是num_classes
             neg_inds = assigned_label == self.student.roi_head.bbox_head.num_classes
+            #bbox_targets:labels,lable weights,bbox,bbox weights,此处背景框对应的label weights 被bg_score reweighting
             bbox_targets[1][neg_inds] = bg_score[neg_inds].detach()
         loss = self.student.roi_head.bbox_head.loss(
             bbox_results["cls_score"],
@@ -242,12 +260,13 @@ class SoftTeacherSingle(MultiSteamDetector):
             reduction_override="none",
         )
         loss["loss_cls"] = loss["loss_cls"].sum() / max(bbox_targets[1].sum(), 1.0)
+        #loss_box??
         loss["loss_bbox"] = loss["loss_bbox"].sum() / max(
             bbox_targets[1].size()[0], 1.0
         )
         if len(gt_bboxes[0]) > 0:
             log_image_with_boxes(
-                "rcnn_cls",
+                "fcos_cls",
                 student_info["img"][0],
                 gt_bboxes[0],
                 bbox_tag="pseudo_label",
@@ -276,7 +295,7 @@ class SoftTeacherSingle(MultiSteamDetector):
             thr=-self.train_cfg.reg_pseudo_threshold,
         )
         log_every_n(
-            {"rcnn_reg_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
+            {"fcos_reg_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
         )
         loss_bbox = self.student.roi_head.forward_train(
             feat, img_metas, proposal_list, gt_bboxes, gt_labels, **kwargs
@@ -345,7 +364,8 @@ class SoftTeacherSingle(MultiSteamDetector):
             student_info["centerness"] = list(centerness)
         
         student_info["img_metas"] = img_metas
-        student_info["proposals"] = proposals
+        #proposal可以注释掉？
+        #student_info["proposals"] = proposals
         student_info["transform_matrix"] = [
             torch.from_numpy(meta["transform_matrix"]).float().to(feat[0][0].device)
             for meta in img_metas
@@ -356,33 +376,35 @@ class SoftTeacherSingle(MultiSteamDetector):
         teacher_info = {}
         feat = self.teacher.extract_feat(img)
         teacher_info["backbone_feature"] = feat
-        if proposals is None:
-            proposal_cfg = self.teacher.train_cfg.get(
-                "rpn_proposal", self.teacher.test_cfg.rpn
-            )
-            rpn_out = list(self.teacher.rpn_head(feat))
-            proposal_list = self.teacher.rpn_head.get_bboxes(
-                *rpn_out, img_metas=img_metas, cfg=proposal_cfg
-            )
-        else:
-            proposal_list = proposals
-        teacher_info["proposals"] = proposal_list
+        # if proposals is None:
+        #     proposal_cfg = self.teacher.train_cfg.get(
+        #         "rpn_proposal", self.teacher.test_cfg.rpn
+        #     )
+        #     rpn_out = list(self.teacher.rpn_head(feat))
+        #     proposal_list = self.teacher.rpn_head.get_bboxes(
+        #         *rpn_out, img_metas=img_metas, cfg=proposal_cfg
+        #     )
+        # else:
+        #     proposal_list = proposals
+        # teacher_info["proposals"] = proposal_list
 
-        proposal_list, proposal_label_list = self.teacher.roi_head.simple_test_bboxes(
-            feat, img_metas, proposal_list, self.teacher.test_cfg.rcnn, rescale=False
-        )
 
-        proposal_list = [p.to(feat[0].device) for p in proposal_list]
-        proposal_list = [
-            p if p.shape[0] > 0 else p.new_zeros(0, 5) for p in proposal_list
-        ]
-        proposal_label_list = [p.to(feat[0].device) for p in proposal_label_list]
-        # filter invalid box roughly
+        # proposal_list, proposal_label_list = self.teacher.roi_head.simple_test_bboxes(
+        #     feat, img_metas, proposal_list, self.teacher.test_cfg.rcnn, rescale=False
+        # )
+
+        # proposal_list = [p.to(feat[0].device) for p in proposal_list]
+        # proposal_list = [
+        #     p if p.shape[0] > 0 else p.new_zeros(0, 5) for p in proposal_list
+        # ]
+        # proposal_label_list = [p.to(feat[0].device) for p in proposal_label_list]
+        # # filter invalid box roughly
         if isinstance(self.train_cfg.pseudo_label_initial_score_thr, float):
             thr = self.train_cfg.pseudo_label_initial_score_thr
         else:
             # TODO: use dynamic threshold
             raise NotImplementedError("Dynamic Threshold is not implemented yet.")
+        #根据pseudo_label_initial_score_thr初步筛选需要过滤掉的伪标签
         proposal_list, proposal_label_list, _ = list(
             zip(
                 *[
@@ -399,6 +421,7 @@ class SoftTeacherSingle(MultiSteamDetector):
                 ]
             )
         )
+        #roi的回归loss，要将thr0.5筛选过后的框抖动，从新喂给teacher算uncertainty
         det_bboxes = proposal_list
         reg_unc = self.compute_uncertainty_with_aug(
             feat, img_metas, proposal_list, proposal_label_list
